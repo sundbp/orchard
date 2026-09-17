@@ -36,7 +36,8 @@
    (java.util.concurrent.locks ReentrantLock)
    (javax.lang.model.element Element ElementKind ExecutableElement TypeElement VariableElement)
    (javax.lang.model.type ArrayType TypeKind TypeVariable)
-   (javax.tools DocumentationTool DocumentationTool$DocumentationTask ToolProvider)
+   (javax.tools DocumentationTool DocumentationTool$DocumentationTask
+                StandardJavaFileManager ToolProvider)
    (jdk.javadoc.doclet Doclet DocletEnvironment)))
 
 ;;; ## Java Parsing
@@ -77,44 +78,87 @@
 ;; constructor, and the latter is required.
 (def ^:private result (atom nil))
 
+(defn- release-source-lifecycle!
+  "Release, exactly once, the resources a `parse-java` call allocated: the
+  compiler file manager, the copied source file, and its temporary directory.
+  Every release step is attempted even when an earlier one fails, so one
+  failure never hides the state of the rest. Returns a vector of cleanup
+  failures ([] when everything was released, including on a repeated call);
+  the caller decides how to surface them."
+  [released? file-mgr tmpfile tmpdir]
+  (if @released?
+    []
+    (do (vreset! released? true)
+        (let [problems (volatile! [])]
+          (when-let [^StandardJavaFileManager fm @file-mgr]
+            (try (.close fm)
+                 (catch Throwable t (vswap! problems conj t))))
+          (try
+            (when (and (.exists tmpfile)
+                       (not (.delete tmpfile)))
+              (vswap! problems conj
+                      (ex-info "Failed to delete copied Java source file"
+                               {:file (str tmpfile)})))
+            (catch Throwable t (vswap! problems conj t)))
+          (try
+            (when-not (.delete tmpdir)
+              (vswap! problems conj
+                      (ex-info "Failed to delete temporary Java source directory"
+                               {:dir (str tmpdir)})))
+            (catch Throwable t (vswap! problems conj t)))
+          @problems))))
+
 (defn- parse-java
-  "Load and parse the resource url, returning a `DocletEnvironment` object."
+  "Load and parse the resource url, returning a map with `:env` (the parsed
+  `DocletEnvironment`) and `:cleanup` (a thunk calling
+  `release-source-lifecycle!` for this call's resources). `:env` stays backed
+  by the temporary files until its last use, so the caller MUST invoke
+  `:cleanup` when done with `:env`, on success and on failure alike. On a
+  failure inside this function the resources are released here and the
+  cleanup failures ride along as suppressed exceptions."
   [^URL url, module]
-  (let [fname    (.getName (io/file (.getFile url)))
-        tmpdir   (.toFile (Files/createTempDirectory "tmp" (into-array FileAttribute [])))
-        tmpfile  (io/file tmpdir fname)
-        ^DocumentationTool compiler (ToolProvider/getSystemDocumentationTool)
-        sources  (-> (.getStandardFileManager compiler nil nil nil)
-                     (.getJavaFileObjectsFromFiles [tmpfile]))
-        doclet   (class (reify Doclet
-                          (init [_this _ _]
-                            (reset! result nil))
-
-                          (run [_this root]
-                            (reset! result root)
-                            true)
-
-                          (getSupportedOptions [_this]
-                            #{})))
-        out      (StringWriter.)        ; discard compiler messages
-        opts     (concat ["--show-members" "private"
-                          "--show-types" "private"
-                          "--show-packages" "all"
-                          "--show-module-contents" "all"
-                          "-quiet"]
-                         (when module
-                           ["--patch-module" (str module "=" tmpdir)]))
-        _ (spit tmpfile (slurp url))
-        task (.getTask compiler out nil nil doclet opts sources)]
+  (let [fname     (.getName (io/file (.getFile url)))
+        tmpdir    (.toFile (Files/createTempDirectory "tmp" (into-array FileAttribute [])))
+        tmpfile   (io/file tmpdir fname)
+        file-mgr  (volatile! nil)
+        released? (volatile! false)
+        cleanup   #(release-source-lifecycle! released? file-mgr tmpfile tmpdir)]
     (try
-      (if (false? (.call ^DocumentationTool$DocumentationTask task))
-        (throw (ex-info "Failed to parse Java source code"
-                        {:path url
-                         :module module
-                         :out (str out)}))
-        @result)
-      (finally
-        (.delete tmpdir)))))
+      (let [^DocumentationTool compiler (ToolProvider/getSystemDocumentationTool)
+            fm      (.getStandardFileManager compiler nil nil nil)
+            _       (vreset! file-mgr fm)
+            sources (.getJavaFileObjectsFromFiles fm [tmpfile])
+            doclet  (class (reify Doclet
+                             (init [_this _ _]
+                               (reset! result nil))
+
+                             (run [_this root]
+                               (reset! result root)
+                               true)
+
+                             (getSupportedOptions [_this]
+                               #{})))
+            out     (StringWriter.)        ; discard compiler messages
+            opts    (concat ["--show-members" "private"
+                             "--show-types" "private"
+                             "--show-packages" "all"
+                             "--show-module-contents" "all"
+                             "-quiet"]
+                            (when module
+                              ["--patch-module" (str module "=" tmpdir)]))
+            _       (spit tmpfile (slurp url))
+            task    (.getTask compiler out fm nil doclet opts sources)]
+        (if (false? (.call ^DocumentationTool$DocumentationTask task))
+          (throw (ex-info "Failed to parse Java source code"
+                          {:path url
+                           :module module
+                           :out (str out)}))
+          {:env    @result
+           :cleanup cleanup}))
+      (catch Throwable t
+        (doseq [^Throwable problem (cleanup)]
+          (.addSuppressed t problem))
+        (throw t)))))
 
 ;;; ## Java Parse Tree Traversal
 ;;
@@ -422,18 +466,28 @@
    {:pre [(class? klass)]}
    (misc/with-lock lock ;; the jdk.javadoc.doclet classes aren't meant for concurrent modification/access.
      (let [class-sym (symbol (.getName klass))
-           ^DocletEnvironment root (parse-java source-url (compat/module-name klass))]
-       (when root
-         (try
-           (some #(when (#{ElementKind/CLASS
-                           ElementKind/INTERFACE
-                           ElementKind/ENUM}
-                         (.getKind ^Element %))
-                    (let [info (parse-info % root)]
-                      (when (= (:class info) class-sym)
-                        info)))
-                 (.getIncludedElements root))
-           (finally (.close (.getJavaFileManager root)))))))))
+           {:keys [env cleanup]} (parse-java source-url (compat/module-name klass))]
+       (try
+         (let [info (when env
+                      (some #(when (#{ElementKind/CLASS
+                                      ElementKind/INTERFACE
+                                      ElementKind/ENUM}
+                                    (.getKind ^Element %))
+                               (let [info (parse-info % env)]
+                                 (when (= (:class info) class-sym)
+                                   info)))
+                             (.getIncludedElements env)))
+               problems (cleanup)]
+           (when (seq problems)
+             (throw (ex-info "Failed to clean up Java source parsing resources"
+                             {:class class-sym
+                              :problems (mapv ex-message problems)}
+                             (first problems))))
+           info)
+         (catch Throwable t
+           (doseq [^Throwable problem (cleanup)]
+             (.addSuppressed t problem))
+           (throw t)))))))
 
 #_(source-info `Thread)
 #_(source-info 'mx.cider.orchard.LruMap)
