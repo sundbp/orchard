@@ -476,7 +476,7 @@
                                (let [info (parse-info % env)]
                                  (when (= (:class info) class-sym)
                                    info)))
-                             (.getIncludedElements env)))
+                            (.getIncludedElements env)))
                problems (cleanup)]
            (when (seq problems)
              (throw (ex-info "Failed to clean up Java source parsing resources"

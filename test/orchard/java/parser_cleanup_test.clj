@@ -20,13 +20,14 @@
 
   Self-contained: this namespace uses only Clojure, the JDK, and Orchard, so
   it runs both in orchard's own test suite and in the resident REPL of an
-  embedding application. It resolves parser vars at call time, so it works
-  with any implementation version loaded into the namespace, and the tests
-  are order-independent."
+  embedding application. The parser namespace is only loaded on JDK 11+,
+  via requiring-resolve under the guard below, matching
+  orchard.java.parser-next-test, so this namespace itself loads on JDK 8;
+  calling the resolved var always uses the currently loaded implementation,
+  and the tests are order-independent."
   (:require
    [clojure.java.io :as io]
    [clojure.test :refer [deftest is testing]]
-   [orchard.java.parser-next :as parser]
    [orchard.java.source-files :as src-files]
    [orchard.misc :as misc])
   (:import
@@ -45,7 +46,16 @@
 (def ^:private jdk-sources-present?
   "True when the running JDK ships readable sources, in which case the
   module-backed source lookup can be exercised end to end."
-  (some? (src-files/class->source-file-url java.util.HashMap)))
+  (and jdk11+?
+       (some? (src-files/class->source-file-url java.util.HashMap))))
+
+(def ^:private source-info
+  "The parser's `source-info` var, resolved only on JDK 11+ so that this
+  namespace loads on JDK 8, where orchard.java.parser-next cannot; matching
+  the pattern in orchard.java.parser-next-test. Calling the var always uses
+  the currently loaded implementation."
+  (when jdk11+?
+    (requiring-resolve 'orchard.java.parser-next/source-info)))
 
 (when (and jdk11+? (not jdk-sources-present?))
   (println "orchard.java.parser-cleanup-test: module-backed source lookup not"
@@ -131,11 +141,18 @@
     (is (seq owned) "the harness observed the parser's temporary paths")
     (is (every? #(not (.exists ^File %)) owned))))
 
+(defn- injected-traversal-failure
+  "Fault injection for the traversal-failure check: thrown instead of real
+  parse-tree traversal while the parser's allocation and parse paths stay
+  real."
+  [_element _env]
+  (throw (ex-info "injected traversal failure" {:injected? true})))
+
 (when jdk11+?
   (deftest success-releases-owned-temporary-resources
     (testing "successful source-info"
       (dotimes [_ 2]
-        (let [[info owned] (observe-owned-paths #(parser/source-info lru-map-class-sym))]
+        (let [[info owned] (observe-owned-paths #(source-info lru-map-class-sym))]
           (try
             (assert-usable-source-info info lru-map-class-sym)
             (assert-no-owned-artifacts owned)
@@ -149,7 +166,7 @@
             broken-url   (-> invalid-file .toURI .toURL)
             [result owned] (observe-owned-paths
                             #(try
-                               (parser/source-info clojure.lang.PersistentVector broken-url)
+                               (source-info clojure.lang.PersistentVector broken-url)
                                ::no-throw
                                (catch Exception e
                                  {:message (ex-message e)
@@ -173,7 +190,7 @@
             dir-url      (-> fixture-root .toURI .toURL)
             [result owned] (observe-owned-paths
                             #(try
-                               (parser/source-info clojure.lang.PersistentVector dir-url)
+                               (source-info clojure.lang.PersistentVector dir-url)
                                ::no-throw
                                (catch Exception e
                                  {:message (ex-message e)
@@ -190,17 +207,18 @@
 
   (deftest traversal-failure-preserves-primary-error-and-releases-owned-resources
     (testing "failure during source-info traversal"
-      (let [[result owned]
-            (observe-owned-paths
-             #(try
-                (with-redefs [parser/parse-info (fn [_element _env]
-                                                  (throw (ex-info "injected traversal failure"
-                                                                  {:injected? true})))]
-                  (parser/source-info lru-map-class-sym)
-                  ::no-throw)
-                (catch Exception e
-                  {:message (ex-message e)
-                   :data (ex-data e)})))]
+      (let [parse-info-var (requiring-resolve 'orchard.java.parser-next/parse-info)
+            [result owned]
+            (with-redefs-fn {parse-info-var injected-traversal-failure}
+              (fn []
+                (observe-owned-paths
+                 (fn []
+                   (try
+                     (source-info lru-map-class-sym)
+                     ::no-throw
+                     (catch Exception e
+                       {:message (ex-message e)
+                        :data (ex-data e)}))))))]
         (try
           (testing "the primary traversal error is preserved"
             (is (map? result))
@@ -212,7 +230,7 @@
   (when jdk-sources-present?
     (deftest module-backed-lookup-releases-owned-temporary-resources
       (testing "module-backed source lookup"
-        (let [[info owned] (observe-owned-paths #(parser/source-info 'java.util.HashMap))]
+        (let [[info owned] (observe-owned-paths #(source-info 'java.util.HashMap))]
           (try
             (assert-usable-source-info info 'java.util.HashMap)
             (assert-no-owned-artifacts owned)
