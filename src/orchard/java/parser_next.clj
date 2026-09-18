@@ -85,7 +85,7 @@
   failure never hides the state of the rest. Returns a vector of cleanup
   failures ([] when everything was released, including on a repeated call);
   the caller decides how to surface them."
-  [released? file-mgr tmpfile tmpdir]
+  [released? file-mgr ^java.io.File tmpfile ^java.io.File tmpdir]
   (if @released?
     []
     (do (vreset! released? true)
@@ -476,7 +476,7 @@
                                (let [info (parse-info % env)]
                                  (when (= (:class info) class-sym)
                                    info)))
-                            (.getIncludedElements env)))
+                            (.getIncludedElements ^DocletEnvironment env)))
                problems (cleanup)]
            (when (seq problems)
              (throw (ex-info "Failed to clean up Java source parsing resources"
